@@ -82,10 +82,9 @@ jobs:
 
           # 3. Alpine's own config, taken from the published linux-lts package
           # (exactly what Alpine runs; no external site needed)
-          mkdir -p /lts-apk /lts
-          apk fetch --no-cache -o /lts-apk linux-lts
-          apk extract --allow-untrusted --destdir /lts /lts-apk/linux-lts-*.apk
-          CFG="$(ls /lts/boot/config-* | head -1)"
+          # (installed into this throwaway container; works with any apk version)
+          apk add --no-cache --no-scripts linux-lts
+          CFG="$(ls /boot/config-*-lts | head -1)"
           echo "Base config: $CFG"
 
           mkdir -p /build/main/linux-zen
@@ -143,13 +142,14 @@ jobs:
           sed -i "s|@PKGVER@|$PKGVER|g; s|@KERNVER@|$KERNVER|g" APKBUILD
 
           abuild -F checksum
-          abuild -F -r
+          abuild -F -K -r
 
           cp /root/packages/*/x86_64/linux-zen-*.apk /out/
 
-          # Extract kernel + build a tiny initramfs for the QEMU smoke test
-          mkdir /x && apk extract --allow-untrusted --destdir /x /out/linux-zen-*.apk
-          cp /x/boot/vmlinuz-zen /out/vmlinuz
+          # Grab the kernel from the kept package dir + build a tiny initramfs for the QEMU smoke test
+          VMLINUZ="$(find /build/main/linux-zen -path '*boot/vmlinuz-zen' | head -1)"
+          [ -n "$VMLINUZ" ] || { echo "vmlinuz-zen not found"; exit 1; }
+          cp "$VMLINUZ" /out/vmlinuz
           mkdir -p /initrd/bin /initrd/proc /initrd/sys /initrd/dev
           cp /bin/busybox.static /initrd/bin/busybox
           cat > /initrd/init <<'INIT'
