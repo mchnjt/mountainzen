@@ -13,8 +13,13 @@ on:
         description: "Alpine image tag to build in (e.g. 3.24 or latest)"
         type: string
         default: "3.24"
+      track:
+        description: "latest-zen = newest Zen release overall; alpine-series = newest Zen release in Alpine's linux-lts series (may be far behind Alpine's patch level)"
+        type: choice
+        options: [latest-zen, alpine-series]
+        default: latest-zen
       zen_tag:
-        description: "Force a Zen tag, e.g. v6.18.7-zen1 (blank = newest Zen release in Alpine's series)"
+        description: "Force a Zen tag, e.g. v6.18.13-zen1 (overrides track)"
         type: string
         default: ""
       run_vm_test:
@@ -29,6 +34,7 @@ jobs:
     env:
       ALPINE_VERSION: ${{ inputs.alpine_version }}
       ZEN_TAG: ${{ inputs.zen_tag }}
+      TRACK: ${{ inputs.track }}
     steps:
       - name: Free disk space
         run: |
@@ -56,7 +62,11 @@ jobs:
           if [ -n "${ZEN_TAG:-}" ]; then
             CANDIDATES="$ZEN_TAG"
           else
-            RE="^v$(echo "$SERIES" | sed 's/\./\\./g')(\.[0-9]+)?-zen[0-9]+$"
+            if [ "$TRACK" = "alpine-series" ]; then
+              RE="^v$(echo "$SERIES" | sed 's/\./\\./g')(\.[0-9]+)?-zen[0-9]+$"
+            else
+              RE="^v[0-9]+\.[0-9]+(\.[0-9]+)?-zen[0-9]+$"
+            fi
             CANDIDATES="$(git ls-remote --tags --refs ${base}.git | sed 's|.*refs/tags/||' | grep -E "$RE" | sort -rV)"
           fi
           TAG=""
@@ -70,12 +80,12 @@ jobs:
           echo "Using Zen $TAG (vanilla $PKGVER; Alpine has $ALPINE_KVER)"
           echo "$VER" > /out/VERSION
 
-          # 3. Alpine's own x86_64 LTS config from the matching stable branch
-          BRANCH="$(cut -d. -f1,2 /etc/alpine-release)-stable"
-          git clone -q --depth 1 --branch "$BRANCH" --filter=blob:none --sparse \
-            https://gitlab.alpinelinux.org/alpine/aports.git /aports
-          git -C /aports sparse-checkout set main/linux-lts
-          CFG="$(ls /aports/main/linux-lts/* | grep x86_64 | grep -i config | head -1)"
+          # 3. Alpine's own config, taken from the published linux-lts package
+          # (exactly what Alpine runs; no external site needed)
+          mkdir -p /lts-apk /lts
+          apk fetch --no-cache -o /lts-apk linux-lts
+          apk extract --allow-untrusted --destdir /lts /lts-apk/linux-lts-*.apk
+          CFG="$(ls /lts/boot/config-* | head -1)"
           echo "Base config: $CFG"
 
           mkdir -p /build/main/linux-zen
@@ -93,13 +103,9 @@ jobs:
           arch="x86_64"
           license="GPL-2.0-only"
           options="!strip !check !tracedeps !archcheck"
-          makedepends="bash bc bison flex openssl-dev elfutils-dev perl gmp-dev
-            mpc1-dev mpfr-dev xz zstd diffutils findutils linux-headers kmod
-            python3 ncurses-dev build-base coreutils gawk patch"
+          makedepends="bash bc bison flex openssl-dev elfutils-dev perl gmp-dev mpc1-dev mpfr-dev xz zstd diffutils findutils linux-headers kmod python3 ncurses-dev build-base coreutils gawk patch"
           _kernver=@KERNVER@
-          source="https://cdn.kernel.org/pub/linux/kernel/v${pkgver%%.*}.x/linux-$_kernver.tar.xz
-            zen.patch
-            config-x86_64"
+          source="https://cdn.kernel.org/pub/linux/kernel/v${pkgver%%.*}.x/linux-$_kernver.tar.xz zen.patch config-x86_64"
           case $pkgver in
             *.*.*) source="$source https://cdn.kernel.org/pub/linux/kernel/v${pkgver%%.*}.x/patch-$pkgver.xz" ;;
           esac
@@ -160,8 +166,9 @@ jobs:
 
       - name: Build apk in Alpine container
         run: |
+          set -o pipefail
           docker run --rm \
-            -e ZEN_TAG \
+            -e ZEN_TAG -e TRACK \
             -v "$PWD/work:/work" -v "$PWD/out:/out" \
             "alpine:${ALPINE_VERSION}" sh /work/build.sh 2>&1 | tee build.log
           ls -lh out
