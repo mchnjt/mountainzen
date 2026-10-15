@@ -1,0 +1,207 @@
+name: Build Alpine Zen kernel
+
+# Save as .github/workflows/build-alpine-kernel.yml
+#
+# Idea: take the kernel series Alpine ships as linux-lts, download the vanilla
+# source, apply the Zen patch for that series, reuse Alpine's own LTS config,
+# package as an apk, boot-test in QEMU, then upload the apk.
+
+on:
+  workflow_dispatch:
+    inputs:
+      alpine_version:
+        description: "Alpine image tag to build in (e.g. 3.24 or latest)"
+        type: string
+        default: "3.24"
+      zen_tag:
+        description: "Force a Zen tag, e.g. v6.18.7-zen1 (blank = newest Zen release in Alpine's series)"
+        type: string
+        default: ""
+      run_vm_test:
+        description: "Boot-test the kernel in QEMU before publishing"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      ALPINE_VERSION: ${{ inputs.alpine_version }}
+      ZEN_TAG: ${{ inputs.zen_tag }}
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Write build script
+        run: |
+          mkdir -p work out
+          cat > work/build.sh <<'SCRIPT'
+          #!/bin/sh
+          set -eux
+          apk add --no-cache alpine-sdk git wget zstd coreutils busybox-static cpio
+          export PACKAGER="CI <ci@localhost>"
+          abuild-keygen -a -n
+          cp /root/.abuild/*.rsa.pub /out/
+
+          # 1. Which kernel series does this Alpine release ship?
+          ALPINE_KVER="$(apk search -x linux-lts | head -1 | sed -E 's/^linux-lts-//; s/-r[0-9]+$//')"
+          SERIES="$(echo "$ALPINE_KVER" | cut -d. -f1,2)"
+          echo "Alpine linux-lts: $ALPINE_KVER (series $SERIES)"
+
+          # 2. Newest Zen release in that series that actually has a patch asset
+          base=https://github.com/zen-kernel/zen-kernel
+          if [ -n "${ZEN_TAG:-}" ]; then
+            CANDIDATES="$ZEN_TAG"
+          else
+            RE="^v$(echo "$SERIES" | sed 's/\./\\./g')(\.[0-9]+)?-zen[0-9]+$"
+            CANDIDATES="$(git ls-remote --tags --refs ${base}.git | sed 's|.*refs/tags/||' | grep -E "$RE" | sort -rV)"
+          fi
+          TAG=""
+          for t in $CANDIDATES; do
+            if wget -q --spider "$base/releases/download/$t/linux-$t.patch.zst"; then TAG="$t"; break; fi
+          done
+          [ -n "$TAG" ] || { echo "No Zen release with a patch found for series $SERIES"; exit 1; }
+          VER="${TAG#v}"
+          PKGVER="${VER%-zen*}"
+          KERNVER="$(echo "$PKGVER" | cut -d. -f1,2)"
+          echo "Using Zen $TAG (vanilla $PKGVER; Alpine has $ALPINE_KVER)"
+          echo "$VER" > /out/VERSION
+
+          # 3. Alpine's own x86_64 LTS config from the matching stable branch
+          BRANCH="$(cut -d. -f1,2 /etc/alpine-release)-stable"
+          git clone -q --depth 1 --branch "$BRANCH" --filter=blob:none --sparse \
+            https://gitlab.alpinelinux.org/alpine/aports.git /aports
+          git -C /aports sparse-checkout set main/linux-lts
+          CFG="$(ls /aports/main/linux-lts/* | grep x86_64 | grep -i config | head -1)"
+          echo "Base config: $CFG"
+
+          mkdir -p /build/main/linux-zen
+          cd /build/main/linux-zen
+          cp "$CFG" config-x86_64
+          wget -q -O zen.patch.zst "$base/releases/download/$TAG/linux-$TAG.patch.zst"
+          zstd -d -f zen.patch.zst -o zen.patch
+
+          cat > APKBUILD <<'APKBUILD'
+          pkgname=linux-zen
+          pkgver=@PKGVER@
+          pkgrel=0
+          pkgdesc="Zen-patched kernel built from Alpine's LTS config"
+          url="https://github.com/zen-kernel/zen-kernel"
+          arch="x86_64"
+          license="GPL-2.0-only"
+          options="!strip !check !tracedeps !archcheck"
+          makedepends="bash bc bison flex openssl-dev elfutils-dev perl gmp-dev
+            mpc1-dev mpfr-dev xz zstd diffutils findutils linux-headers kmod
+            python3 ncurses-dev build-base coreutils gawk patch"
+          _kernver=@KERNVER@
+          source="https://cdn.kernel.org/pub/linux/kernel/v${pkgver%%.*}.x/linux-$_kernver.tar.xz
+            zen.patch
+            config-x86_64"
+          case $pkgver in
+            *.*.*) source="$source https://cdn.kernel.org/pub/linux/kernel/v${pkgver%%.*}.x/patch-$pkgver.xz" ;;
+          esac
+          builddir="$srcdir/linux-$_kernver"
+
+          prepare() {
+            cd "$builddir"
+            case $pkgver in
+              *.*.*) unxz -c "$srcdir/patch-$pkgver.xz" | patch -Np1 ;;
+            esac
+            patch -Np1 -i "$srcdir/zen.patch"
+            cp "$srcdir/config-x86_64" .config
+          }
+
+          build() {
+            cd "$builddir"
+            scripts/config --set-str LOCALVERSION "-alpine-zen"
+            scripts/config -d DEBUG_INFO_BTF -d DEBUG_INFO_BTF_MODULES
+            scripts/config -e ZENIFY
+            make olddefconfig
+            make -j"$(nproc)" bzImage modules
+          }
+
+          package() {
+            cd "$builddir"
+            local kver
+            kver=$(make -s kernelrelease)
+            make INSTALL_MOD_PATH="$pkgdir" INSTALL_MOD_STRIP=1 modules_install
+            rm -f "$pkgdir/lib/modules/$kver/build" "$pkgdir/lib/modules/$kver/source"
+            install -Dm644 arch/x86/boot/bzImage "$pkgdir/boot/vmlinuz-zen"
+            install -Dm644 System.map "$pkgdir/boot/System.map-zen"
+            install -Dm644 .config "$pkgdir/boot/config-zen"
+          }
+          APKBUILD
+          sed -i "s|@PKGVER@|$PKGVER|g; s|@KERNVER@|$KERNVER|g" APKBUILD
+
+          abuild -F checksum
+          abuild -F -r
+
+          cp /root/packages/*/x86_64/linux-zen-*.apk /out/
+
+          # Extract kernel + build a tiny initramfs for the QEMU smoke test
+          mkdir /x && apk extract --allow-untrusted --destdir /x /out/linux-zen-*.apk
+          cp /x/boot/vmlinuz-zen /out/vmlinuz
+          mkdir -p /initrd/bin /initrd/proc /initrd/sys /initrd/dev
+          cp /bin/busybox.static /initrd/bin/busybox
+          cat > /initrd/init <<'INIT'
+          #!/bin/busybox sh
+          /bin/busybox mount -t proc proc /proc
+          /bin/busybox mount -t sysfs sys /sys
+          /bin/busybox mount -t devtmpfs dev /dev
+          echo "KERNEL_BOOT_OK release=$(/bin/busybox uname -r)"
+          /bin/busybox poweroff -f
+          INIT
+          chmod +x /initrd/init
+          (cd /initrd && find . | cpio -o -H newc | gzip) > /out/initramfs.gz
+          SCRIPT
+
+      - name: Build apk in Alpine container
+        run: |
+          docker run --rm \
+            -e ZEN_TAG \
+            -v "$PWD/work:/work" -v "$PWD/out:/out" \
+            "alpine:${ALPINE_VERSION}" sh /work/build.sh 2>&1 | tee build.log
+          ls -lh out
+          echo "ZEN_VER=$(cat out/VERSION)" >> "$GITHUB_ENV"
+
+      - name: Install QEMU
+        if: ${{ inputs.run_vm_test }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+
+      - name: Boot-test kernel in QEMU
+        if: ${{ inputs.run_vm_test }}
+        run: |
+          timeout 180 qemu-system-x86_64 \
+            -accel kvm -accel tcg -m 1G -nographic -no-reboot \
+            -kernel out/vmlinuz -initrd out/initramfs.gz \
+            -append "console=ttyS0 panic=-1" 2>&1 | tee qemu.log || true
+          grep -E "KERNEL_BOOT_OK release=.*zen" qemu.log \
+            || { echo "::error::Kernel failed to boot (or is not the Zen build)"; exit 1; }
+
+      - name: Upload apk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-zen-${{ env.ZEN_VER }}-alpine${{ inputs.alpine_version }}-apk
+          path: |
+            out/linux-zen-*.apk
+            out/*.rsa.pub
+          if-no-files-found: error
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: |
+            build.log
+            qemu.log
+          if-no-files-found: ignore
